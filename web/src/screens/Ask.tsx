@@ -1,12 +1,11 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { dailyReport } from "../api";
 
 /**
- * Ask.tsx (TA + Key Levels cleanup)
- * - No raw JSON blocks by default
- * - No [object Object]
- * - Compact, actionable summaries per TA category
- * - Safe across varied backend shapes
+ * Ask.tsx — decision-ready v1
+ * - "Today's Alerts" derived from your payload
+ * - TradingView free embedded chart for the symbol
+ * - Keeps Outlook / Scenarios / Options lens / News
  */
 
 function Card({ title, subtitle, right, children }: any) {
@@ -32,14 +31,14 @@ function Card({ title, subtitle, right, children }: any) {
   );
 }
 
-function Pill({ tone = "neutral", text }: { tone?: "bull" | "bear" | "warn" | "info" | "neutral"; text: string }) {
+function Pill({ tone = "neutral", text }: { tone?: "high" | "med" | "low" | "info" | "neutral"; text: string }) {
   const c =
-    tone === "bull"
-      ? { bg: "rgba(34,197,94,0.14)", border: "rgba(34,197,94,0.35)", dot: "#22c55e" }
-      : tone === "bear"
+    tone === "high"
       ? { bg: "rgba(239,68,68,0.12)", border: "rgba(239,68,68,0.32)", dot: "#ef4444" }
-      : tone === "warn"
+      : tone === "med"
       ? { bg: "rgba(245,158,11,0.14)", border: "rgba(245,158,11,0.35)", dot: "#f59e0b" }
+      : tone === "low"
+      ? { bg: "rgba(34,197,94,0.14)", border: "rgba(34,197,94,0.35)", dot: "#22c55e" }
       : tone === "info"
       ? { bg: "rgba(96,165,250,0.14)", border: "rgba(96,165,250,0.35)", dot: "#60a5fa" }
       : { bg: "rgba(0,0,0,0.06)", border: "rgba(0,0,0,0.12)", dot: "rgba(0,0,0,0.35)" };
@@ -65,27 +64,6 @@ function Pill({ tone = "neutral", text }: { tone?: "bull" | "bear" | "warn" | "i
   );
 }
 
-function MiniChip({ text }: { text: string }) {
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        padding: "3px 8px",
-        borderRadius: 999,
-        fontSize: 11,
-        fontWeight: 800,
-        background: "rgba(0,0,0,0.05)",
-        border: "1px solid rgba(0,0,0,0.10)",
-        color: "rgba(0,0,0,0.70)",
-        whiteSpace: "nowrap",
-      }}
-    >
-      {text}
-    </span>
-  );
-}
-
 function fmt(n: any, digits = 2) {
   if (n === null || n === undefined) return "—";
   const num = Number(n);
@@ -97,39 +75,6 @@ function fmt(n: any, digits = 2) {
 function nnum(v: any): number | null {
   const x = Number(v);
   return Number.isFinite(x) ? x : null;
-}
-
-function pick(obj: any, keys: string[]) {
-  if (!obj || typeof obj !== "object") return undefined;
-  for (const k of keys) {
-    const v = (obj as any)[k];
-    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
-  }
-  return undefined;
-}
-
-function rangeFrom(obj: any): { a: number; b: number } | null {
-  if (!obj || typeof obj !== "object") return null;
-  const a = nnum(pick(obj, ["low", "lo", "min", "from", "start", "a"]));
-  const b = nnum(pick(obj, ["high", "hi", "max", "to", "end", "b"]));
-  if (a === null || b === null) return null;
-  return a <= b ? { a, b } : { a: b, b: a };
-}
-
-function safeOneLine(obj: any, maxLen = 220) {
-  try {
-    const s = JSON.stringify(obj);
-    if (!s) return "—";
-    if (s.length <= maxLen) return s;
-    return s.slice(0, maxLen - 1) + "…";
-  } catch {
-    return "—";
-  }
-}
-
-function cleanText(s: any) {
-  const t = String(s ?? "").trim();
-  return t.length ? t : "";
 }
 
 function uniq<T>(arr: T[]) {
@@ -153,6 +98,7 @@ function normalizeLevels(keyLevels: any) {
   pushNum(support, keyLevels.support ?? keyLevels.supports);
   pushNum(resistance, keyLevels.resistance ?? keyLevels.resistances);
 
+  // Also parse S1/R1 keys
   for (const [k, v] of Object.entries(keyLevels)) {
     const K = String(k).toUpperCase();
     if (K.startsWith("S")) pushNum(support, v);
@@ -177,228 +123,259 @@ function nearestAbove(price: number | null, arr: number[]) {
   return best;
 }
 
-/** --- Category-specific formatters (avoid [object Object]) --- */
-function fmtGap(x: any) {
-  if (x == null) return "";
-  if (typeof x === "string") return cleanText(x);
-  const r = rangeFrom(x);
-  const dir = cleanText(pick(x, ["direction", "dir", "side", "bias"])) || "";
-  const kind = cleanText(pick(x, ["kind", "type", "name", "label"])) || "Gap";
-  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
-  const fill = pick(x, ["fill", "fill_level", "fillTarget", "fill_target", "target"]);
-  const fillN = nnum(fill);
-  const pieces = [];
-  pieces.push(kind);
-  if (dir) pieces.push(dir);
-  if (tf) pieces.push(tf);
-  const head = pieces.join(" • ");
-  if (r) {
-    const tail = fillN !== null ? `(${fmt(r.a)}–${fmt(r.b)}, fill ${fmt(fillN)})` : `(${fmt(r.a)}–${fmt(r.b)})`;
-    return `${head} ${tail}`.trim();
-  }
-  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
-  if (note) return `${head}: ${note}`;
-  return head || safeOneLine(x);
+function pctAway(price: number, level: number) {
+  return ((level - price) / price) * 100;
 }
 
-function fmtCandle(x: any) {
-  if (x == null) return "";
-  if (typeof x === "string") return cleanText(x);
-  const pattern = cleanText(pick(x, ["pattern", "name", "label", "type", "title"])) || "Candle";
-  const bias = cleanText(pick(x, ["bias", "direction", "dir", "side"])) || "";
-  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
-  const strength = pick(x, ["strength", "score", "confidence"]);
-  const sN = nnum(strength);
-  const parts = [pattern];
-  if (bias) parts.push(bias);
-  if (tf) parts.push(tf);
-  if (sN !== null) parts.push(`strength ${fmt(sN, 0)}`);
-  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
-  return note ? `${parts.join(" • ")} — ${note}` : parts.join(" • ") || safeOneLine(x);
+function toTVSymbol(sym: string) {
+  const s = (sym || "").trim().toUpperCase();
+  if (!s) return "NASDAQ:TSLA";
+  if (s.includes(":")) return s;
+  return `NASDAQ:${s}`;
 }
 
-function fmtSweep(x: any) {
-  if (x == null) return "";
-  if (typeof x === "string") return cleanText(x);
-  const ma = cleanText(pick(x, ["ma", "avg", "name", "label", "type"])) || "MA sweep";
-  const dir = cleanText(pick(x, ["direction", "dir", "side", "bias"])) || "";
-  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
-  const parts = [ma];
-  if (dir) parts.push(dir);
-  if (tf) parts.push(tf);
-  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
-  return note ? `${parts.join(" • ")} — ${note}` : parts.join(" • ") || safeOneLine(x);
-}
+/** TradingView free widget */
+function TradingViewChart({ symbol }: { symbol: string }) {
+  const containerId = useMemo(() => `tv_chart_${symbol.replace(/[^a-zA-Z0-9_]/g, "_")}`, [symbol]);
+  const hostRef = useRef<HTMLDivElement | null>(null);
 
-function fmtFVG(x: any) {
-  if (x == null) return "";
-  if (typeof x === "string") return cleanText(x);
-  const r = rangeFrom(x);
-  const side = cleanText(pick(x, ["side", "direction", "dir", "bias"])) || "";
-  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
-  const kind = cleanText(pick(x, ["type", "name", "label"])) || "FVG";
-  const head = [kind, side, tf].filter(Boolean).join(" • ");
-  if (r) return `${head} (${fmt(r.a)}–${fmt(r.b)})`.trim();
-  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
-  return note ? `${head} — ${note}` : head || safeOneLine(x);
-}
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
 
-function fmtOB(x: any) {
-  if (x == null) return "";
-  if (typeof x === "string") return cleanText(x);
-  const r = rangeFrom(x);
-  const side = cleanText(pick(x, ["side", "direction", "dir", "bias"])) || "";
-  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
-  const kind = cleanText(pick(x, ["type", "name", "label"])) || "Order block";
-  const head = [kind, side, tf].filter(Boolean).join(" • ");
-  if (r) return `${head} (${fmt(r.a)}–${fmt(r.b)})`.trim();
-  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
-  return note ? `${head} — ${note}` : head || safeOneLine(x);
-}
+    host.innerHTML = "";
+    const container = document.createElement("div");
+    container.id = containerId;
+    host.appendChild(container);
 
-function fmtFib(x: any) {
-  if (x == null) return "";
-  if (typeof x === "string") return cleanText(x);
-  if (typeof x !== "object") return String(x);
+    const script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";
+    script.async = true;
 
-  const anchor = (x as any).anchor ?? (x as any).anchors ?? (x as any).swing ?? null;
-  const aRange = rangeFrom(anchor) || rangeFrom(x);
+    script.innerHTML = JSON.stringify({
+      autosize: true,
+      symbol: toTVSymbol(symbol),
+      interval: "D",
+      timezone: "Etc/UTC",
+      theme: "light",
+      style: "1",
+      locale: "en",
+      allow_symbol_change: true,
+      save_image: false,
+      calendar: false,
+      hide_top_toolbar: false,
+      hide_legend: false,
+      hide_side_toolbar: false,
+      support_host: "https://www.tradingview.com",
+    });
 
-  // Pull a few common retracement keys if present
-  const retr = (x as any).retracements ?? (x as any).retracement ?? null;
-  const ext = (x as any).extensions ?? (x as any).extension ?? null;
+    host.appendChild(script);
 
-  const pullLevel = (obj: any, keys: string[]) => {
-    if (!obj || typeof obj !== "object") return null;
-    for (const k of keys) {
-      if (obj[k] !== undefined && obj[k] !== null) {
-        const v = nnum(obj[k]);
-        if (v !== null) return v;
-      }
-    }
-    return null;
-  };
-
-  const fib0382 = pullLevel(retr, ["0.382", "0_382", "0382", "38.2", "382"]);
-  const fib05 = pullLevel(retr, ["0.5", "0_5", "05", "50", "50.0"]);
-  const fib0618 = pullLevel(retr, ["0.618", "0_618", "0618", "61.8", "618"]);
-
-  const ex1272 = pullLevel(ext, ["1.272", "1_272", "1272"]);
-  const ex1618 = pullLevel(ext, ["1.618", "1_618", "1618", "1.62"]);
-
-  const parts: string[] = [];
-  if (aRange) parts.push(`anchor ${fmt(aRange.a)} → ${fmt(aRange.b)}`);
-
-  const lv: string[] = [];
-  if (fib0382 !== null) lv.push(`38.2% ${fmt(fib0382)}`);
-  if (fib05 !== null) lv.push(`50% ${fmt(fib05)}`);
-  if (fib0618 !== null) lv.push(`61.8% ${fmt(fib0618)}`);
-  if (lv.length) parts.push(`retr ${lv.join(" • ")}`);
-
-  const ex: string[] = [];
-  if (ex1272 !== null) ex.push(`1.272 ${fmt(ex1272)}`);
-  if (ex1618 !== null) ex.push(`1.618 ${fmt(ex1618)}`);
-  if (ex.length) parts.push(`ext ${ex.join(" • ")}`);
-
-  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
-  if (tf) parts.push(tf);
-
-  if (parts.length) return `Fib — ${parts.join(" | ")}`;
-
-  // Fallback: if it's an object full of objects, summarize keys
-  const keys = Object.keys(x);
-  if (keys.length) return `Fib (${keys.slice(0, 6).join(", ")}${keys.length > 6 ? ", …" : ""})`;
-  return "Fib";
-}
-
-function fmtDivergence(x: any) {
-  if (x == null) return "";
-  if (typeof x === "string") return cleanText(x);
-  if (typeof x !== "object") return String(x);
-  const t = cleanText(pick(x, ["type", "kind"])) || "";
-  const s = pick(x, ["strength", "score"]);
-  const sn = nnum(s);
-  if (!t || t === "none") return "none";
-  return sn !== null ? `${t} (strength ${fmt(sn, 0)})` : t;
-}
-
-function toArray(v: any) {
-  if (v == null) return [];
-  return Array.isArray(v) ? v : [v];
-}
-
-function TopList({
-  items,
-  formatter,
-  max = 8,
-  emptyText = "—",
-}: {
-  items: any[];
-  formatter: (x: any) => string;
-  max?: number;
-  emptyText?: string;
-}) {
-  const lines = useMemo(() => {
-    const out: string[] = [];
-    for (const it of items || []) {
-      const s = cleanText(formatter(it));
-      if (!s) continue;
-      if (s === "{}" || s === "[]") continue;
-      out.push(s);
-    }
-    // de-dup exact strings and keep top N
-    return uniq(out).slice(0, max);
-  }, [items, formatter, max]);
-
-  if (!lines.length) return <div style={{ color: "rgba(0,0,0,0.55)", fontSize: 12 }}>{emptyText}</div>;
+    return () => {
+      try {
+        host.innerHTML = "";
+      } catch {}
+    };
+  }, [symbol, containerId]);
 
   return (
-    <div style={{ display: "grid", gap: 8 }}>
-      {lines.map((s, i) => (
-        <div
-          key={i}
-          style={{
-            border: "1px solid rgba(0,0,0,0.08)",
-            borderRadius: 12,
-            padding: "10px 12px",
-            background: "rgba(0,0,0,0.02)",
-            display: "flex",
-            gap: 10,
-          }}
-        >
-          <div style={{ width: 18, lineHeight: "18px" }}>•</div>
-          <div style={{ fontSize: 13, lineHeight: 1.25 }}>{s}</div>
-        </div>
-      ))}
-    </div>
+    <div
+      ref={hostRef}
+      style={{
+        width: "100%",
+        height: 520,
+        border: "1px solid rgba(0,0,0,0.08)",
+        borderRadius: 14,
+        overflow: "hidden",
+        background: "#fff",
+      }}
+    />
   );
 }
 
-function TASection({
-  title,
-  tone,
-  subtitle,
-  items,
-  formatter,
-}: {
+type Alert = {
+  severity: "high" | "med" | "low" | "info";
   title: string;
-  tone: "bull" | "bear" | "warn" | "info" | "neutral";
-  subtitle: string;
-  items: any[];
-  formatter: (x: any) => string;
-}) {
-  return (
-    <div style={{ display: "grid", gap: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-        <Pill tone={tone} text={title} />
-        <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)" }}>{subtitle}</div>
-        <div style={{ marginLeft: "auto" }}>
-          <MiniChip text={`${(items || []).length} item${(items || []).length === 1 ? "" : "s"}`} />
-        </div>
-      </div>
-      <TopList items={items} formatter={formatter} />
-    </div>
-  );
+  trigger: string;
+  action: string;
+  invalidation?: string;
+};
+
+function buildAlerts(payload: any): Alert[] {
+  const alerts: Alert[] = [];
+  if (!payload || typeof payload !== "object") return alerts;
+
+  const outlook = payload.outlook || {};
+  const trend = payload.trend || {};
+  const tech = payload.technicals || {};
+  const momentum = payload.momentum || {};
+  const liquidity = payload.liquidity || {};
+
+  const levels = normalizeLevels(tech?.key_levels);
+
+  const rsi = nnum(momentum?.rsi14 ?? momentum?.rsi14_value ?? momentum?.rsi);
+  const div = momentum?.rsi_divergence || null;
+  const divType = typeof div === "object" ? String(div?.type || "") : "";
+  const divStrength = typeof div === "object" ? nnum(div?.strength) : null;
+
+  const atrPct = nnum(liquidity?.atr_pct);
+  const atr = nnum(liquidity?.atr14);
+
+  // Try to infer spot from common fields; if missing, we still generate non-proximity alerts.
+  const spotCandidates = [
+    payload.price,
+    payload.last_price,
+    payload.quote?.c,
+    payload.quote?.last,
+    tech.last_close,
+    tech.close,
+    tech.spot,
+    outlook.spot,
+    outlook.price,
+    outlook.expected_range_next_day?.low != null && outlook.expected_range_next_day?.high != null
+      ? (Number(outlook.expected_range_next_day.low) + Number(outlook.expected_range_next_day.high)) / 2
+      : null,
+  ];
+  let spot: number | null = null;
+  for (const c of spotCandidates) {
+    const n = nnum(c);
+    if (n !== null) {
+      spot = n;
+      break;
+    }
+  }
+
+  const bias = String(outlook?.bias || "").toLowerCase();
+  if (bias) {
+    alerts.push({
+      severity: bias.includes("bull") ? "low" : bias.includes("bear") ? "high" : "info",
+      title: `Bias: ${outlook.bias}`,
+      trigger: "Engine outlook",
+      action: bias.includes("bull")
+        ? "Prioritize longs; avoid shorting strength."
+        : bias.includes("bear")
+        ? "Prioritize shorts / hedges; avoid chasing upside."
+        : "Trade level-to-level; avoid chasing either direction.",
+    });
+  }
+
+  const regime = String(trend?.state || "").toLowerCase();
+  if (regime) {
+    alerts.push({
+      severity: regime.includes("down") ? "high" : regime.includes("up") ? "low" : "info",
+      title: `Regime: ${trend.state}`,
+      trigger: "Trend state",
+      action: regime.includes("range") ? "Fade extremes; confirm at support/resistance." : "Trade with the regime; confirm on break/hold.",
+    });
+  }
+
+  if (rsi !== null) {
+    if (rsi <= 35) {
+      alerts.push({
+        severity: "med",
+        title: `RSI ${fmt(rsi, 1)} (oversold-ish)`,
+        trigger: "RSI <= 35",
+        action: "Watch bounce triggers at support; avoid fresh shorts into exhaustion.",
+      });
+    } else if (rsi >= 65) {
+      alerts.push({
+        severity: "med",
+        title: `RSI ${fmt(rsi, 1)} (overbought-ish)`,
+        trigger: "RSI >= 65",
+        action: "Avoid chasing; consider trimming longs into strength.",
+      });
+    } else if (rsi < 45) {
+      alerts.push({
+        severity: "info",
+        title: `RSI ${fmt(rsi, 1)} (weak momentum)`,
+        trigger: "RSI < 45",
+        action: "Be selective on longs; prefer buys only at support or on reclaim.",
+      });
+    } else if (rsi > 55) {
+      alerts.push({
+        severity: "info",
+        title: `RSI ${fmt(rsi, 1)} (positive momentum)`,
+        trigger: "RSI > 55",
+        action: "Prefer longs; look for continuation entries on break/hold.",
+      });
+    }
+  }
+
+  if (divType && divType !== "none") {
+    alerts.push({
+      severity: (divStrength ?? 0) >= 3 ? "high" : "med",
+      title: `RSI divergence: ${divType}`,
+      trigger: `Strength ${divStrength ?? "?"}`,
+      action: "Momentum warning: tighten stops and demand confirmation at levels.",
+    });
+  }
+
+  if (atrPct !== null || atr !== null) {
+    const pct = atrPct !== null ? atrPct * 100 : null;
+    const sev = pct !== null && pct >= 4 ? "high" : pct !== null && pct >= 2.5 ? "med" : "info";
+    alerts.push({
+      severity: sev,
+      title: `Volatility: ATR ${atr !== null ? fmt(atr) : "—"} (${pct !== null ? fmt(pct, 2) + "%" : "—"})`,
+      trigger: "ATR-based volatility",
+      action: sev === "high" ? "Size down; widen stops; expect fast moves." : "Normal sizing; respect levels.",
+    });
+  }
+
+  // Level proximity alerts if spot is known + levels exist
+  if (spot !== null) {
+    const ns = nearestBelow(spot, levels.support);
+    const nr = nearestAbove(spot, levels.resistance);
+
+    if (ns !== null) {
+      const away = Math.abs(pctAway(spot, ns));
+      alerts.push({
+        severity: away <= 1.0 ? "high" : "info",
+        title: away <= 1.0 ? `Near support: ${fmt(ns)} (${fmt(away, 2)}% away)` : `Closest support: ${fmt(ns)}`,
+        trigger: away <= 1.0 ? "Within 1% of support" : "Nearest support below spot",
+        action: away <= 1.0
+          ? "Hold/reclaim → bounce setup. Break → risk-off / shorts favored."
+          : "Best long entries often come on holds/reclaims here.",
+        invalidation: away <= 1.0 ? `Clean break below ${fmt(ns)}` : undefined,
+      });
+    }
+
+    if (nr !== null) {
+      const away = Math.abs(pctAway(spot, nr));
+      alerts.push({
+        severity: away <= 1.0 ? "high" : "info",
+        title: away <= 1.0 ? `Near resistance: ${fmt(nr)} (${fmt(away, 2)}% away)` : `Closest resistance: ${fmt(nr)}`,
+        trigger: away <= 1.0 ? "Within 1% of resistance" : "Nearest resistance above spot",
+        action: away <= 1.0
+          ? "Break+hold → breakout setup. Reject → mean reversion / trim longs."
+          : "Break/hold above this is a key continuation signal.",
+        invalidation: away <= 1.0 ? `Failed hold above ${fmt(nr)}` : undefined,
+      });
+    }
+  }
+
+  // News awareness
+  const newsCount = nnum(payload?.news_context?.headline_count_7d) ?? 0;
+  alerts.push({
+    severity: newsCount === 0 ? "info" : "med",
+    title: newsCount === 0 ? "News: quiet (0 stored headlines / 7d)" : `News: ${newsCount} headline(s) / 7d`,
+    trigger: "Stored RSS context",
+    action: newsCount === 0 ? "Catalyst risk low from stored RSS; price action likely leads." : "Scan headlines; adjust sizing around catalysts.",
+  });
+
+  const rank: Record<string, number> = { high: 3, med: 2, low: 1, info: 0, neutral: 0 };
+  alerts.sort((a, b) => rank[b.severity] - rank[a.severity]);
+
+  // De-dupe by title and cap
+  const seen = new Set<string>();
+  const out = [];
+  for (const a of alerts) {
+    if (seen.has(a.title)) continue;
+    seen.add(a.title);
+    out.push(a);
+    if (out.length >= 7) break;
+  }
+  return out;
 }
 
 export default function Ask() {
@@ -407,7 +384,6 @@ export default function Ask() {
   const [loading, setLoading] = useState(false);
   const [out, setOut] = useState<any>(null);
   const [err, setErr] = useState<string>("");
-  const [showRaw, setShowRaw] = useState(false);
 
   async function run() {
     setErr("");
@@ -423,72 +399,7 @@ export default function Ask() {
   }
 
   const outlook = out?.outlook;
-
-  const tech = out?.technicals || {};
-  const keyLevelsRaw = tech?.key_levels;
-  const levels = useMemo(() => normalizeLevels(keyLevelsRaw), [keyLevelsRaw]);
-
-  // price: try multiple likely locations without breaking if absent
-  const price = useMemo(() => {
-    const candidates = [
-      out?.price,
-      out?.last_price,
-      out?.quote?.last,
-      out?.quote?.c,
-      out?.market?.price,
-      outlook?.spot,
-      outlook?.price,
-    ];
-    for (const c of candidates) {
-      const n = Number(c);
-      if (Number.isFinite(n)) return n;
-    }
-    return null;
-  }, [out, outlook]);
-
-  const supportNear = useMemo(() => nearestBelow(price, levels.support), [price, levels.support]);
-  const resistanceNear = useMemo(() => nearestAbove(price, levels.resistance), [price, levels.resistance]);
-
-  // TA buckets (defensive)
-  const gapsItems = toArray(tech?.gaps);
-  const candlesItems = toArray(tech?.candles);
-  const sweepsItems = toArray(tech?.ma_sweeps);
-  const fvgItems = toArray(tech?.fair_value_gaps);
-  const obItems = toArray(tech?.order_blocks);
-  const fibItems = toArray(tech?.fibonacci);
-  const div = out?.momentum?.rsi_divergence;
-  const divLine = fmtDivergence(div);
-
-  // Actionable summary: keep compact + actually actionable
-  const summaryLines = useMemo(() => {
-    const lines: { tone: "bull" | "bear" | "warn" | "info" | "neutral"; text: string }[] = [];
-
-    const bias = outlook?.bias ? String(outlook.bias).toLowerCase() : "";
-    if (bias.includes("bull")) lines.push({ tone: "bull", text: `Bias: ${outlook.bias}` });
-    else if (bias.includes("bear")) lines.push({ tone: "bear", text: `Bias: ${outlook.bias}` });
-    else if (outlook?.bias) lines.push({ tone: "neutral", text: `Bias: ${outlook.bias}` });
-
-    if (outlook?.expected_range_next_day?.low != null && outlook?.expected_range_next_day?.high != null) {
-      lines.push({
-        tone: "info",
-        text: `Next-day range: ${fmt(outlook.expected_range_next_day.low)} → ${fmt(outlook.expected_range_next_day.high)}`,
-      });
-    } else if (price !== null) {
-      lines.push({ tone: "info", text: `Spot: ${fmt(price)}` });
-    }
-
-    if (supportNear !== null) lines.push({ tone: "info", text: `Hold above ${fmt(supportNear)} to keep bounce thesis intact` });
-    if (resistanceNear !== null) lines.push({ tone: "info", text: `Break and hold above ${fmt(resistanceNear)} for continuation / breakout` });
-
-    if (divLine && divLine !== "none") lines.push({ tone: "warn", text: `RSI divergence: ${divLine}` });
-
-    // Pick 1–2 most important TA cues (by existence) without dumping noise
-    if ((gapsItems || []).length) lines.push({ tone: "info", text: `Gaps present: watch fills near key levels` });
-    if ((fvgItems || []).length) lines.push({ tone: "info", text: `FVG zones present: use as magnet / reaction areas` });
-    if ((sweepsItems || []).length) lines.push({ tone: "warn", text: `MA sweeps present: mean reversion risk elevated` });
-
-    return lines.slice(0, 6);
-  }, [outlook, price, supportNear, resistanceNear, divLine, gapsItems.length, fvgItems.length, sweepsItems.length]);
+  const alerts = useMemo(() => buildAlerts(out), [out]);
 
   return (
     <div>
@@ -528,6 +439,53 @@ export default function Ask() {
       </Card>
 
       {err && <div style={{ color: "crimson", marginTop: 12, whiteSpace: "pre-wrap" }}>{err}</div>}
+
+      {out && (
+        <>
+          <Card title="TradingView chart" subtitle="Free embedded chart (context). Use Alerts below for decisions." right={<Pill tone="info" text={toTVSymbol(symbol)} />}>
+            <TradingViewChart symbol={symbol} />
+          </Card>
+
+          <Card title="Today's Alerts" subtitle="High-signal, trader-usable items derived from the report (v1)">
+            {alerts.length === 0 ? (
+              <div style={{ color: "rgba(0,0,0,0.55)" }}>No alerts generated from this payload.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 10 }}>
+                {alerts.map((a, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      border: "1px solid rgba(0,0,0,0.08)",
+                      borderRadius: 14,
+                      padding: 12,
+                      background:
+                        a.severity === "high" ? "rgba(239,68,68,0.04)" : a.severity === "med" ? "rgba(245,158,11,0.05)" : "rgba(0,0,0,0.02)",
+                      display: "grid",
+                      gap: 6,
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                      <div style={{ fontWeight: 900 }}>{a.title}</div>
+                      <Pill tone={a.severity} text={a.severity.toUpperCase()} />
+                    </div>
+                    <div style={{ fontSize: 13, color: "rgba(0,0,0,0.72)" }}>
+                      <b>Trigger:</b> {a.trigger}
+                    </div>
+                    <div style={{ fontSize: 13 }}>
+                      <b>Action:</b> {a.action}
+                    </div>
+                    {a.invalidation ? (
+                      <div style={{ fontSize: 13, color: "rgba(0,0,0,0.72)" }}>
+                        <b>Invalidation:</b> {a.invalidation}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        </>
+      )}
 
       {outlook && (
         <>
@@ -584,167 +542,6 @@ export default function Ask() {
             {(outlook.options_lens?.wheel?.spreads || []).map((t: string, i: number) => (
               <div key={i}>• {t}</div>
             ))}
-          </Card>
-
-          <Card
-            title="TA & Key Levels"
-            subtitle="Readable signals (no blobs). Levels + the few cues that actually matter."
-            right={
-              <button
-                onClick={() => setShowRaw((s) => !s)}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.14)",
-                  background: showRaw ? "rgba(0,0,0,0.05)" : "#fff",
-                  fontWeight: 900,
-                  cursor: "pointer",
-                  fontSize: 12,
-                }}
-                title="Debug toggle"
-              >
-                {showRaw ? "Hide raw" : "Show raw"}
-              </button>
-            }
-          >
-            <div style={{ display: "grid", gap: 12 }}>
-              <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 14, padding: 12, background: "rgba(0,0,0,0.015)" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-                  <div style={{ fontWeight: 900 }}>Actionable summary</div>
-                  <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)" }}>Use this to make a decision</div>
-                </div>
-                <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
-                  {summaryLines.length === 0 ? (
-                    <div style={{ color: "rgba(0,0,0,0.55)", fontSize: 12 }}>No TA context returned for this symbol yet.</div>
-                  ) : (
-                    summaryLines.map((x, i) => (
-                      <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-                        <span
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: 999,
-                            marginTop: 6,
-                            background:
-                              x.tone === "bull"
-                                ? "#22c55e"
-                                : x.tone === "bear"
-                                ? "#ef4444"
-                                : x.tone === "warn"
-                                ? "#f59e0b"
-                                : x.tone === "info"
-                                ? "#60a5fa"
-                                : "rgba(0,0,0,0.35)",
-                          }}
-                        />
-                        <div style={{ fontSize: 13, lineHeight: 1.25 }}>{x.text}</div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
-                <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 14, padding: 12 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <div style={{ fontWeight: 900 }}>Support</div>
-                    <Pill tone="bull" text="Buy zones" />
-                  </div>
-                  <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
-                    {levels.support.slice(0, 5).map((lv, i) => (
-                      <div
-                        key={i}
-                        style={{
-                          border: "1px solid rgba(0,0,0,0.08)",
-                          borderRadius: 12,
-                          padding: "10px 12px",
-                          background: "rgba(34,197,94,0.06)",
-                          display: "flex",
-                          justifyContent: "space-between",
-                        }}
-                      >
-                        <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(0,0,0,0.55)" }}>S{i + 1}</div>
-                        <div style={{ fontWeight: 900 }}>{fmt(lv)}</div>
-                      </div>
-                    ))}
-                    {levels.support.length === 0 ? <div style={{ color: "rgba(0,0,0,0.55)", fontSize: 12 }}>—</div> : null}
-                  </div>
-                </div>
-
-                <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 14, padding: 12 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <div style={{ fontWeight: 900 }}>Resistance</div>
-                    <Pill tone="bear" text="Sell zones" />
-                  </div>
-                  <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
-                    {levels.resistance.slice(0, 5).map((lv, i) => (
-                      <div
-                        key={i}
-                        style={{
-                          border: "1px solid rgba(0,0,0,0.08)",
-                          borderRadius: 12,
-                          padding: "10px 12px",
-                          background: "rgba(239,68,68,0.05)",
-                          display: "flex",
-                          justifyContent: "space-between",
-                        }}
-                      >
-                        <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(0,0,0,0.55)" }}>R{i + 1}</div>
-                        <div style={{ fontWeight: 900 }}>{fmt(lv)}</div>
-                      </div>
-                    ))}
-                    {levels.resistance.length === 0 ? <div style={{ color: "rgba(0,0,0,0.55)", fontSize: 12 }}>—</div> : null}
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 14, padding: 12 }}>
-                <div style={{ fontWeight: 900 }}>TA flags</div>
-                <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)", marginTop: 2 }}>
-                  Compact readouts — ranges, patterns, and the “what/where”, not blobs.
-                </div>
-
-                <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 16 }}>
-                  <TASection title="Gaps" tone="info" subtitle="Imbalances / potential fill targets" items={gapsItems} formatter={fmtGap} />
-                  <TASection title="Candles" tone="info" subtitle="Reversal / continuation hints" items={candlesItems} formatter={fmtCandle} />
-                  <TASection title="MA sweeps" tone="warn" subtitle="Liquidity / mean reversion risk" items={sweepsItems} formatter={fmtSweep} />
-                  <TASection
-                    title="RSI divergence"
-                    tone={divLine && divLine !== "none" ? "warn" : "neutral"}
-                    subtitle="Momentum warning"
-                    items={div ? [divLine] : []}
-                    formatter={(x) => String(x)}
-                  />
-                  <TASection title="FVG" tone="info" subtitle="Fair value gaps (reaction zones)" items={fvgItems} formatter={fmtFVG} />
-                  <TASection title="Order blocks" tone="info" subtitle="Supply / demand zones" items={obItems} formatter={fmtOB} />
-                </div>
-
-                <div style={{ marginTop: 16 }}>
-                  <TASection title="Fibonacci" tone="info" subtitle="Anchor + key retracements/extensions" items={fibItems} formatter={fmtFib} />
-                </div>
-
-                {showRaw ? (
-                  <div style={{ marginTop: 14 }}>
-                    <div style={{ fontWeight: 900, fontSize: 12, color: "rgba(0,0,0,0.65)" }}>Raw (debug)</div>
-                    <pre style={{ whiteSpace: "pre-wrap", marginTop: 8, fontSize: 12, background: "rgba(0,0,0,0.03)", padding: 12, borderRadius: 12, border: "1px solid rgba(0,0,0,0.08)" }}>
-                      {safeOneLine(
-                        {
-                          key_levels: tech?.key_levels,
-                          gaps: tech?.gaps,
-                          candles: tech?.candles,
-                          ma_sweeps: tech?.ma_sweeps,
-                          rsi_divergence: out?.momentum?.rsi_divergence,
-                          fvg: tech?.fair_value_gaps,
-                          order_blocks: tech?.order_blocks,
-                          fibonacci: tech?.fibonacci,
-                        },
-                        5000
-                      )}
-                    </pre>
-                  </div>
-                ) : null}
-              </div>
-            </div>
           </Card>
 
           <Card title="Recent news (if any)">
