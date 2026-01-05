@@ -1,3 +1,5 @@
+import { buildSignals } from "./signals";
+
 export interface Env {
   DB: D1Database;
   APP_SECRET: string;
@@ -957,8 +959,10 @@ async function generateDailyOutlookReport(env: Env, symbol: string, asof: string
         },
       },
     },
-  ,
-  signals: buildSignals({
+  };
+
+  // Attach decision-ready TA signals (candles, RSI divergence, FVGs, liquidity sweeps, MA crosses)
+  (payload as any).signals = buildSignals({
     timeframe: "D",
     bars: (technicals as any)?.ohlcv ?? (technicals as any)?.bars ?? [],
     rsi14: momentum?.rsi14 ?? null,
@@ -967,11 +971,10 @@ async function generateDailyOutlookReport(env: Env, symbol: string, asof: string
     ma: {
       sma20: trend?.sma20 ?? null,
       sma50: trend?.sma50 ?? null,
-      sma200: trend?.sma200 ?? null,
-    }
-    spot: (technicals as any)?.last_close ?? null,
-  })
-};
+      sma200: trend?.sma200 ?? null
+    },
+    spot: (technicals as any)?.last_close ?? null
+  });
 
   return payload;
 }
