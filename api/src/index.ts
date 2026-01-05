@@ -957,7 +957,21 @@ async function generateDailyOutlookReport(env: Env, symbol: string, asof: string
         },
       },
     },
-  };
+  ,
+  signals: buildSignals({
+    timeframe: "D",
+    bars: (technicals as any)?.ohlcv ?? (technicals as any)?.bars ?? [],
+    rsi14: momentum?.rsi14 ?? null,
+    rsi_divergence: momentum?.rsi_divergence ?? null,
+    key_levels: technicals?.key_levels,
+    ma: {
+      sma20: trend?.sma20 ?? null,
+      sma50: trend?.sma50 ?? null,
+      sma200: trend?.sma200 ?? null,
+    },
+    spot: (technicals as any)?.last_close ?? null,
+  })
+};
 
   return payload;
 }
