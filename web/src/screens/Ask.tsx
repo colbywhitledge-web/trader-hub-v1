@@ -1,6 +1,14 @@
 import React, { useMemo, useState } from "react";
 import { dailyReport } from "../api";
 
+/**
+ * Ask.tsx (TA + Key Levels cleanup)
+ * - No raw JSON blocks by default
+ * - No [object Object]
+ * - Compact, actionable summaries per TA category
+ * - Safe across varied backend shapes
+ */
+
 function Card({ title, subtitle, right, children }: any) {
   return (
     <div
@@ -57,6 +65,27 @@ function Pill({ tone = "neutral", text }: { tone?: "bull" | "bear" | "warn" | "i
   );
 }
 
+function MiniChip({ text }: { text: string }) {
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        padding: "3px 8px",
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 800,
+        background: "rgba(0,0,0,0.05)",
+        border: "1px solid rgba(0,0,0,0.10)",
+        color: "rgba(0,0,0,0.70)",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {text}
+    </span>
+  );
+}
+
 function fmt(n: any, digits = 2) {
   if (n === null || n === undefined) return "—";
   const num = Number(n);
@@ -65,9 +94,31 @@ function fmt(n: any, digits = 2) {
   return num.toFixed(digits);
 }
 
-function safeStringify(v: any, maxLen = 160) {
+function nnum(v: any): number | null {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : null;
+}
+
+function pick(obj: any, keys: string[]) {
+  if (!obj || typeof obj !== "object") return undefined;
+  for (const k of keys) {
+    const v = (obj as any)[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return undefined;
+}
+
+function rangeFrom(obj: any): { a: number; b: number } | null {
+  if (!obj || typeof obj !== "object") return null;
+  const a = nnum(pick(obj, ["low", "lo", "min", "from", "start", "a"]));
+  const b = nnum(pick(obj, ["high", "hi", "max", "to", "end", "b"]));
+  if (a === null || b === null) return null;
+  return a <= b ? { a, b } : { a: b, b: a };
+}
+
+function safeOneLine(obj: any, maxLen = 220) {
   try {
-    const s = JSON.stringify(v);
+    const s = JSON.stringify(obj);
     if (!s) return "—";
     if (s.length <= maxLen) return s;
     return s.slice(0, maxLen - 1) + "…";
@@ -76,51 +127,17 @@ function safeStringify(v: any, maxLen = 160) {
   }
 }
 
-function compactObjectSummary(obj: any) {
-  if (!obj || typeof obj !== "object") return "—";
-  const preferred = ["name", "label", "title", "pattern", "type", "side", "note", "summary", "description", "desc", "reason"];
-  for (const k of preferred) {
-    if (obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return String(obj[k]);
-  }
-  // if range-ish
-  const lo = obj.low ?? obj.lo ?? obj.min;
-  const hi = obj.high ?? obj.hi ?? obj.max;
-  if (lo !== undefined && hi !== undefined && (Number.isFinite(Number(lo)) || Number.isFinite(Number(hi)))) return `${fmt(lo)} → ${fmt(hi)}`;
-
-  const from = obj.from ?? obj.start;
-  const to = obj.to ?? obj.end;
-  if (from !== undefined && to !== undefined && (Number.isFinite(Number(from)) || Number.isFinite(Number(to)))) return `${fmt(from)} → ${fmt(to)}`;
-
-  // scalar kv pairs (up to 4)
-  const scalars = Object.entries(obj).filter(([, v]) => v !== null && v !== undefined && typeof v !== "object");
-  if (scalars.length) {
-    return scalars
-      .slice(0, 4)
-      .map(([k, v]) => `${k}: ${typeof v === "number" ? fmt(v) : String(v)}`)
-      .join(" • ");
-  }
-  return safeStringify(obj);
+function cleanText(s: any) {
+  const t = String(s ?? "").trim();
+  return t.length ? t : "";
 }
 
-function renderLine(v: any) {
-  if (v === null || v === undefined) return "—";
-  if (typeof v === "string") return v.trim() || "—";
-  if (typeof v === "number") return fmt(v);
-  if (typeof v === "boolean") return v ? "yes" : "no";
-  if (Array.isArray(v)) {
-    if (v.length === 0) return "—";
-    // if simple list
-    if (v.every((x) => typeof x === "string" || typeof x === "number" || typeof x === "boolean")) {
-      return v.map((x) => (typeof x === "number" ? fmt(x) : String(x))).join(" • ");
-    }
-    return `${v.length} item${v.length === 1 ? "" : "s"}`;
-  }
-  if (typeof v === "object") return compactObjectSummary(v);
-  return String(v);
+function uniq<T>(arr: T[]) {
+  return Array.from(new Set(arr));
 }
 
 function normalizeLevels(keyLevels: any) {
-  if (!keyLevels || typeof keyLevels !== "object") return { support: [], resistance: [] };
+  if (!keyLevels || typeof keyLevels !== "object") return { support: [] as number[], resistance: [] as number[] };
 
   const support: number[] = [];
   const resistance: number[] = [];
@@ -136,16 +153,14 @@ function normalizeLevels(keyLevels: any) {
   pushNum(support, keyLevels.support ?? keyLevels.supports);
   pushNum(resistance, keyLevels.resistance ?? keyLevels.resistances);
 
-  // Also parse S1/R1-style keys
   for (const [k, v] of Object.entries(keyLevels)) {
     const K = String(k).toUpperCase();
     if (K.startsWith("S")) pushNum(support, v);
     if (K.startsWith("R")) pushNum(resistance, v);
   }
 
-  const uniq = (arr: number[]) => Array.from(new Set(arr.map((x) => Number(x)).filter((x) => Number.isFinite(x))));
-  const sU = uniq(support).sort((a, b) => b - a); // high-to-low supports
-  const rU = uniq(resistance).sort((a, b) => a - b); // low-to-high resistances
+  const sU = uniq(support.map((x) => Number(x)).filter((x) => Number.isFinite(x))).sort((a, b) => b - a);
+  const rU = uniq(resistance.map((x) => Number(x)).filter((x) => Number.isFinite(x))).sort((a, b) => a - b);
   return { support: sU, resistance: rU };
 }
 
@@ -162,11 +177,184 @@ function nearestAbove(price: number | null, arr: number[]) {
   return best;
 }
 
-function ListBox({ items }: { items: any[] }) {
-  if (!items || items.length === 0) return <div style={{ color: "rgba(0,0,0,0.55)", fontSize: 12 }}>—</div>;
+/** --- Category-specific formatters (avoid [object Object]) --- */
+function fmtGap(x: any) {
+  if (x == null) return "";
+  if (typeof x === "string") return cleanText(x);
+  const r = rangeFrom(x);
+  const dir = cleanText(pick(x, ["direction", "dir", "side", "bias"])) || "";
+  const kind = cleanText(pick(x, ["kind", "type", "name", "label"])) || "Gap";
+  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
+  const fill = pick(x, ["fill", "fill_level", "fillTarget", "fill_target", "target"]);
+  const fillN = nnum(fill);
+  const pieces = [];
+  pieces.push(kind);
+  if (dir) pieces.push(dir);
+  if (tf) pieces.push(tf);
+  const head = pieces.join(" • ");
+  if (r) {
+    const tail = fillN !== null ? `(${fmt(r.a)}–${fmt(r.b)}, fill ${fmt(fillN)})` : `(${fmt(r.a)}–${fmt(r.b)})`;
+    return `${head} ${tail}`.trim();
+  }
+  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
+  if (note) return `${head}: ${note}`;
+  return head || safeOneLine(x);
+}
+
+function fmtCandle(x: any) {
+  if (x == null) return "";
+  if (typeof x === "string") return cleanText(x);
+  const pattern = cleanText(pick(x, ["pattern", "name", "label", "type", "title"])) || "Candle";
+  const bias = cleanText(pick(x, ["bias", "direction", "dir", "side"])) || "";
+  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
+  const strength = pick(x, ["strength", "score", "confidence"]);
+  const sN = nnum(strength);
+  const parts = [pattern];
+  if (bias) parts.push(bias);
+  if (tf) parts.push(tf);
+  if (sN !== null) parts.push(`strength ${fmt(sN, 0)}`);
+  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
+  return note ? `${parts.join(" • ")} — ${note}` : parts.join(" • ") || safeOneLine(x);
+}
+
+function fmtSweep(x: any) {
+  if (x == null) return "";
+  if (typeof x === "string") return cleanText(x);
+  const ma = cleanText(pick(x, ["ma", "avg", "name", "label", "type"])) || "MA sweep";
+  const dir = cleanText(pick(x, ["direction", "dir", "side", "bias"])) || "";
+  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
+  const parts = [ma];
+  if (dir) parts.push(dir);
+  if (tf) parts.push(tf);
+  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
+  return note ? `${parts.join(" • ")} — ${note}` : parts.join(" • ") || safeOneLine(x);
+}
+
+function fmtFVG(x: any) {
+  if (x == null) return "";
+  if (typeof x === "string") return cleanText(x);
+  const r = rangeFrom(x);
+  const side = cleanText(pick(x, ["side", "direction", "dir", "bias"])) || "";
+  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
+  const kind = cleanText(pick(x, ["type", "name", "label"])) || "FVG";
+  const head = [kind, side, tf].filter(Boolean).join(" • ");
+  if (r) return `${head} (${fmt(r.a)}–${fmt(r.b)})`.trim();
+  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
+  return note ? `${head} — ${note}` : head || safeOneLine(x);
+}
+
+function fmtOB(x: any) {
+  if (x == null) return "";
+  if (typeof x === "string") return cleanText(x);
+  const r = rangeFrom(x);
+  const side = cleanText(pick(x, ["side", "direction", "dir", "bias"])) || "";
+  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
+  const kind = cleanText(pick(x, ["type", "name", "label"])) || "Order block";
+  const head = [kind, side, tf].filter(Boolean).join(" • ");
+  if (r) return `${head} (${fmt(r.a)}–${fmt(r.b)})`.trim();
+  const note = cleanText(pick(x, ["note", "summary", "desc", "description"])) || "";
+  return note ? `${head} — ${note}` : head || safeOneLine(x);
+}
+
+function fmtFib(x: any) {
+  if (x == null) return "";
+  if (typeof x === "string") return cleanText(x);
+  if (typeof x !== "object") return String(x);
+
+  const anchor = (x as any).anchor ?? (x as any).anchors ?? (x as any).swing ?? null;
+  const aRange = rangeFrom(anchor) || rangeFrom(x);
+
+  // Pull a few common retracement keys if present
+  const retr = (x as any).retracements ?? (x as any).retracement ?? null;
+  const ext = (x as any).extensions ?? (x as any).extension ?? null;
+
+  const pullLevel = (obj: any, keys: string[]) => {
+    if (!obj || typeof obj !== "object") return null;
+    for (const k of keys) {
+      if (obj[k] !== undefined && obj[k] !== null) {
+        const v = nnum(obj[k]);
+        if (v !== null) return v;
+      }
+    }
+    return null;
+  };
+
+  const fib0382 = pullLevel(retr, ["0.382", "0_382", "0382", "38.2", "382"]);
+  const fib05 = pullLevel(retr, ["0.5", "0_5", "05", "50", "50.0"]);
+  const fib0618 = pullLevel(retr, ["0.618", "0_618", "0618", "61.8", "618"]);
+
+  const ex1272 = pullLevel(ext, ["1.272", "1_272", "1272"]);
+  const ex1618 = pullLevel(ext, ["1.618", "1_618", "1618", "1.62"]);
+
+  const parts: string[] = [];
+  if (aRange) parts.push(`anchor ${fmt(aRange.a)} → ${fmt(aRange.b)}`);
+
+  const lv: string[] = [];
+  if (fib0382 !== null) lv.push(`38.2% ${fmt(fib0382)}`);
+  if (fib05 !== null) lv.push(`50% ${fmt(fib05)}`);
+  if (fib0618 !== null) lv.push(`61.8% ${fmt(fib0618)}`);
+  if (lv.length) parts.push(`retr ${lv.join(" • ")}`);
+
+  const ex: string[] = [];
+  if (ex1272 !== null) ex.push(`1.272 ${fmt(ex1272)}`);
+  if (ex1618 !== null) ex.push(`1.618 ${fmt(ex1618)}`);
+  if (ex.length) parts.push(`ext ${ex.join(" • ")}`);
+
+  const tf = cleanText(pick(x, ["timeframe", "tf", "interval"])) || "";
+  if (tf) parts.push(tf);
+
+  if (parts.length) return `Fib — ${parts.join(" | ")}`;
+
+  // Fallback: if it's an object full of objects, summarize keys
+  const keys = Object.keys(x);
+  if (keys.length) return `Fib (${keys.slice(0, 6).join(", ")}${keys.length > 6 ? ", …" : ""})`;
+  return "Fib";
+}
+
+function fmtDivergence(x: any) {
+  if (x == null) return "";
+  if (typeof x === "string") return cleanText(x);
+  if (typeof x !== "object") return String(x);
+  const t = cleanText(pick(x, ["type", "kind"])) || "";
+  const s = pick(x, ["strength", "score"]);
+  const sn = nnum(s);
+  if (!t || t === "none") return "none";
+  return sn !== null ? `${t} (strength ${fmt(sn, 0)})` : t;
+}
+
+function toArray(v: any) {
+  if (v == null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function TopList({
+  items,
+  formatter,
+  max = 8,
+  emptyText = "—",
+}: {
+  items: any[];
+  formatter: (x: any) => string;
+  max?: number;
+  emptyText?: string;
+}) {
+  const lines = useMemo(() => {
+    const out: string[] = [];
+    for (const it of items || []) {
+      const s = cleanText(formatter(it));
+      if (!s) continue;
+      if (s === "{}" || s === "[]") continue;
+      out.push(s);
+    }
+    // de-dup exact strings and keep top N
+    return uniq(out).slice(0, max);
+  }, [items, formatter, max]);
+
+  if (!lines.length) return <div style={{ color: "rgba(0,0,0,0.55)", fontSize: 12 }}>{emptyText}</div>;
+
   return (
     <div style={{ display: "grid", gap: 8 }}>
-      {items.map((it, i) => (
+      {lines.map((s, i) => (
         <div
           key={i}
           style={{
@@ -179,21 +367,36 @@ function ListBox({ items }: { items: any[] }) {
           }}
         >
           <div style={{ width: 18, lineHeight: "18px" }}>•</div>
-          <div style={{ fontSize: 13, lineHeight: 1.25 }}>{renderLine(it)}</div>
+          <div style={{ fontSize: 13, lineHeight: 1.25 }}>{s}</div>
         </div>
       ))}
     </div>
   );
 }
 
-function Section({ title, tone, subtitle, items }: any) {
+function TASection({
+  title,
+  tone,
+  subtitle,
+  items,
+  formatter,
+}: {
+  title: string;
+  tone: "bull" | "bear" | "warn" | "info" | "neutral";
+  subtitle: string;
+  items: any[];
+  formatter: (x: any) => string;
+}) {
   return (
     <div style={{ display: "grid", gap: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         <Pill tone={tone} text={title} />
-        {subtitle ? <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)" }}>{subtitle}</div> : null}
+        <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)" }}>{subtitle}</div>
+        <div style={{ marginLeft: "auto" }}>
+          <MiniChip text={`${(items || []).length} item${(items || []).length === 1 ? "" : "s"}`} />
+        </div>
       </div>
-      <ListBox items={items} />
+      <TopList items={items} formatter={formatter} />
     </div>
   );
 }
@@ -204,6 +407,7 @@ export default function Ask() {
   const [loading, setLoading] = useState(false);
   const [out, setOut] = useState<any>(null);
   const [err, setErr] = useState<string>("");
+  const [showRaw, setShowRaw] = useState(false);
 
   async function run() {
     setErr("");
@@ -245,52 +449,46 @@ export default function Ask() {
   const supportNear = useMemo(() => nearestBelow(price, levels.support), [price, levels.support]);
   const resistanceNear = useMemo(() => nearestAbove(price, levels.resistance), [price, levels.resistance]);
 
-  // TA buckets (defensive; accept arrays or objects)
-  const gapsItems = Array.isArray(tech?.gaps) ? tech.gaps : tech?.gaps ? [tech.gaps] : [];
-  const candlesItems = Array.isArray(tech?.candles) ? tech.candles : tech?.candles ? [tech.candles] : [];
-  const sweepsItems = Array.isArray(tech?.ma_sweeps) ? tech.ma_sweeps : tech?.ma_sweeps ? [tech.ma_sweeps] : [];
-  const fvgItems = Array.isArray(tech?.fair_value_gaps) ? tech.fair_value_gaps : tech?.fair_value_gaps ? [tech.fair_value_gaps] : [];
-  const obItems = Array.isArray(tech?.order_blocks) ? tech.order_blocks : tech?.order_blocks ? [tech.order_blocks] : [];
-  const fibRaw = tech?.fibonacci;
-  const fibItems = fibRaw ? (Array.isArray(fibRaw) ? fibRaw : [fibRaw]) : [];
+  // TA buckets (defensive)
+  const gapsItems = toArray(tech?.gaps);
+  const candlesItems = toArray(tech?.candles);
+  const sweepsItems = toArray(tech?.ma_sweeps);
+  const fvgItems = toArray(tech?.fair_value_gaps);
+  const obItems = toArray(tech?.order_blocks);
+  const fibItems = toArray(tech?.fibonacci);
   const div = out?.momentum?.rsi_divergence;
-  const divItems = div ? (Array.isArray(div) ? div : [div]) : [];
+  const divLine = fmtDivergence(div);
 
-  // Actionable summary: keep compact and never show [object Object]
+  // Actionable summary: keep compact + actually actionable
   const summaryLines = useMemo(() => {
-    const lines: { tone: any; text: string }[] = [];
+    const lines: { tone: "bull" | "bear" | "warn" | "info" | "neutral"; text: string }[] = [];
 
-    // bias-ish from outlook if present
     const bias = outlook?.bias ? String(outlook.bias).toLowerCase() : "";
     if (bias.includes("bull")) lines.push({ tone: "bull", text: `Bias: ${outlook.bias}` });
     else if (bias.includes("bear")) lines.push({ tone: "bear", text: `Bias: ${outlook.bias}` });
     else if (outlook?.bias) lines.push({ tone: "neutral", text: `Bias: ${outlook.bias}` });
 
-    if (price !== null) lines.push({ tone: "info", text: `Spot: ${fmt(price)}` });
-
-    if (supportNear !== null) lines.push({ tone: "info", text: `Support to watch: ${fmt(supportNear)}` });
-    if (resistanceNear !== null) lines.push({ tone: "info", text: `Resistance to watch: ${fmt(resistanceNear)}` });
-
-    // divergence quick hint
-    const divType = typeof div === "object" ? div?.type : null;
-    const divStrength = typeof div === "object" ? div?.strength : null;
-    if (divType && divType !== "none") {
+    if (outlook?.expected_range_next_day?.low != null && outlook?.expected_range_next_day?.high != null) {
       lines.push({
-        tone: "warn",
-        text: `Momentum warning: ${String(divType)}${divStrength !== null && divStrength !== undefined ? ` (strength ${divStrength})` : ""}`,
+        tone: "info",
+        text: `Next-day range: ${fmt(outlook.expected_range_next_day.low)} → ${fmt(outlook.expected_range_next_day.high)}`,
       });
+    } else if (price !== null) {
+      lines.push({ tone: "info", text: `Spot: ${fmt(price)}` });
     }
 
-    // if we have meaningful gaps/candles/sweeps, note counts
-    const noteCount = (label: string, count: number, tone: any) => {
-      if (count > 0) lines.push({ tone, text: `${label}: ${count} item${count === 1 ? "" : "s"}` });
-    };
-    noteCount("Gaps", gapsItems.length, "info");
-    noteCount("Candles", candlesItems.length, "info");
-    noteCount("MA sweeps", sweepsItems.length, "warn");
+    if (supportNear !== null) lines.push({ tone: "info", text: `Hold above ${fmt(supportNear)} to keep bounce thesis intact` });
+    if (resistanceNear !== null) lines.push({ tone: "info", text: `Break and hold above ${fmt(resistanceNear)} for continuation / breakout` });
+
+    if (divLine && divLine !== "none") lines.push({ tone: "warn", text: `RSI divergence: ${divLine}` });
+
+    // Pick 1–2 most important TA cues (by existence) without dumping noise
+    if ((gapsItems || []).length) lines.push({ tone: "info", text: `Gaps present: watch fills near key levels` });
+    if ((fvgItems || []).length) lines.push({ tone: "info", text: `FVG zones present: use as magnet / reaction areas` });
+    if ((sweepsItems || []).length) lines.push({ tone: "warn", text: `MA sweeps present: mean reversion risk elevated` });
 
     return lines.slice(0, 6);
-  }, [outlook, price, supportNear, resistanceNear, div, gapsItems.length, candlesItems.length, sweepsItems.length]);
+  }, [outlook, price, supportNear, resistanceNear, divLine, gapsItems.length, fvgItems.length, sweepsItems.length]);
 
   return (
     <div>
@@ -390,14 +588,30 @@ export default function Ask() {
 
           <Card
             title="TA & Key Levels"
-            subtitle="Supports / resistances plus compact context (gaps, candles, sweeps, divergence, FVG, order blocks, fib)."
-            right={<Pill tone="info" text="Actionable view" />}
+            subtitle="Readable signals (no blobs). Levels + the few cues that actually matter."
+            right={
+              <button
+                onClick={() => setShowRaw((s) => !s)}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.14)",
+                  background: showRaw ? "rgba(0,0,0,0.05)" : "#fff",
+                  fontWeight: 900,
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+                title="Debug toggle"
+              >
+                {showRaw ? "Hide raw" : "Show raw"}
+              </button>
+            }
           >
             <div style={{ display: "grid", gap: 12 }}>
               <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 14, padding: 12, background: "rgba(0,0,0,0.015)" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
                   <div style={{ fontWeight: 900 }}>Actionable summary</div>
-                  <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)" }}>What to do, not just what it is</div>
+                  <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)" }}>Use this to make a decision</div>
                 </div>
                 <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
                   {summaryLines.length === 0 ? (
@@ -486,25 +700,49 @@ export default function Ask() {
 
               <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 14, padding: 12 }}>
                 <div style={{ fontWeight: 900 }}>TA flags</div>
-                <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)", marginTop: 2 }}>Quick scan of extra context (kept compact)</div>
+                <div style={{ fontSize: 12, color: "rgba(0,0,0,0.55)", marginTop: 2 }}>
+                  Compact readouts — ranges, patterns, and the “what/where”, not blobs.
+                </div>
 
                 <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 16 }}>
-                  <Section title="Gaps" tone="info" subtitle="Imbalances / fill targets" items={gapsItems} />
-                  <Section title="Candles" tone="info" subtitle="Reversal / continuation hints" items={candlesItems} />
-                  <Section title="MA sweeps" tone="warn" subtitle="Liquidity / mean reversion" items={sweepsItems} />
-                  <Section
+                  <TASection title="Gaps" tone="info" subtitle="Imbalances / potential fill targets" items={gapsItems} formatter={fmtGap} />
+                  <TASection title="Candles" tone="info" subtitle="Reversal / continuation hints" items={candlesItems} formatter={fmtCandle} />
+                  <TASection title="MA sweeps" tone="warn" subtitle="Liquidity / mean reversion risk" items={sweepsItems} formatter={fmtSweep} />
+                  <TASection
                     title="RSI divergence"
-                    tone="warn"
+                    tone={divLine && divLine !== "none" ? "warn" : "neutral"}
                     subtitle="Momentum warning"
-                    items={divItems.length ? divItems : div ? [div] : []}
+                    items={div ? [divLine] : []}
+                    formatter={(x) => String(x)}
                   />
-                  <Section title="FVG" tone="info" subtitle="Fair value gaps" items={fvgItems} />
-                  <Section title="Order blocks" tone="info" subtitle="Supply / demand zones" items={obItems} />
+                  <TASection title="FVG" tone="info" subtitle="Fair value gaps (reaction zones)" items={fvgItems} formatter={fmtFVG} />
+                  <TASection title="Order blocks" tone="info" subtitle="Supply / demand zones" items={obItems} formatter={fmtOB} />
                 </div>
 
                 <div style={{ marginTop: 16 }}>
-                  <Section title="Fibonacci" tone="info" subtitle="Levels / anchors" items={fibItems} />
+                  <TASection title="Fibonacci" tone="info" subtitle="Anchor + key retracements/extensions" items={fibItems} formatter={fmtFib} />
                 </div>
+
+                {showRaw ? (
+                  <div style={{ marginTop: 14 }}>
+                    <div style={{ fontWeight: 900, fontSize: 12, color: "rgba(0,0,0,0.65)" }}>Raw (debug)</div>
+                    <pre style={{ whiteSpace: "pre-wrap", marginTop: 8, fontSize: 12, background: "rgba(0,0,0,0.03)", padding: 12, borderRadius: 12, border: "1px solid rgba(0,0,0,0.08)" }}>
+                      {safeOneLine(
+                        {
+                          key_levels: tech?.key_levels,
+                          gaps: tech?.gaps,
+                          candles: tech?.candles,
+                          ma_sweeps: tech?.ma_sweeps,
+                          rsi_divergence: out?.momentum?.rsi_divergence,
+                          fvg: tech?.fair_value_gaps,
+                          order_blocks: tech?.order_blocks,
+                          fibonacci: tech?.fibonacci,
+                        },
+                        5000
+                      )}
+                    </pre>
+                  </div>
+                ) : null}
               </div>
             </div>
           </Card>
