@@ -968,7 +968,7 @@ async function generateDailyOutlookReport(env: Env, symbol: string, asof: string
       sma20: trend?.sma20 ?? null,
       sma50: trend?.sma50 ?? null,
       sma200: trend?.sma200 ?? null,
-    },
+    }
     spot: (technicals as any)?.last_close ?? null,
   })
 };
