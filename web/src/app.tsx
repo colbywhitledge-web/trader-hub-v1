@@ -1,9 +1,11 @@
 import React, { useMemo, useState } from "react";
 import Ask from "./screens/Ask";
+import News from "./screens/News";
+import Journal from "./screens/Journal";
 import MyTickers from "./screens/MyTickers";
 import Weekly from "./screens/Weekly";
 
-type Tab = "ask" | "tickers" | "weekly";
+type Tab = "ask" | "news" | "journal" | "tickers" | "weekly";
 
 const TabButton = ({ active, onClick, children }: any) => (
   <button
@@ -26,6 +28,8 @@ export default function App() {
 
   const Screen = useMemo(() => {
     if (tab === "ask") return <Ask />;
+    if (tab === "news") return <News />;
+    if (tab === "journal") return <Journal />;
     if (tab === "tickers") return <MyTickers />;
     return <Weekly />;
   }, [tab]);
@@ -39,8 +43,10 @@ export default function App() {
 
       <main style={{ padding: 14 }}>{Screen}</main>
 
-      <nav style={{ position: "fixed", left: 0, right: 0, bottom: 0, background: "white", display: "flex" }}>
+      <nav style={{ position: "fixed", left: 0, right: 0, bottom: 0, background: "white", display: "flex", borderTop: "1px solid #eee" }}>
         <TabButton active={tab === "ask"} onClick={() => setTab("ask")}>Ask</TabButton>
+        <TabButton active={tab === "news"} onClick={() => setTab("news")}>News</TabButton>
+        <TabButton active={tab === "journal"} onClick={() => setTab("journal")}>Journal</TabButton>
         <TabButton active={tab === "tickers"} onClick={() => setTab("tickers")}>My Tickers</TabButton>
         <TabButton active={tab === "weekly"} onClick={() => setTab("weekly")}>Weekly</TabButton>
       </nav>

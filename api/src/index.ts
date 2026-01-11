@@ -877,6 +877,10 @@ async function generateDailyOutlookReport(env: Env, symbol: string, asof: string
     },
 
     technicals: {
+      // Include OHLCV in a compact format so the UI (and signals engine) can render/compute.
+      // (No intraday in v1; this is daily bars.)
+      ohlcv: bars.map((b) => ({ date: b.date, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume })),
+      last_close: lastClose,
       key_levels: { support: recentLows, resistance: recentHighs },
       gaps,
       ma_sweeps: sweeps,
@@ -962,18 +966,25 @@ async function generateDailyOutlookReport(env: Env, symbol: string, asof: string
   };
 
   // Attach decision-ready TA signals (candles, RSI divergence, FVGs, liquidity sweeps, MA crosses)
+  const prevSma20 = sma20[bars.length - 2] ?? null;
+  const prevSma50 = sma50[bars.length - 2] ?? null;
+  const prevSma200 = sma200[bars.length - 2] ?? null;
+
   (payload as any).signals = buildSignals({
     timeframe: "D",
-    bars: (technicals as any)?.ohlcv ?? (technicals as any)?.bars ?? [],
+    bars: (payload as any).technicals?.ohlcv ?? [],
     rsi14: momentum?.rsi14 ?? null,
     rsi_divergence: momentum?.rsi_divergence ?? null,
     key_levels: technicals?.key_levels,
     ma: {
       sma20: trend?.sma20 ?? null,
       sma50: trend?.sma50 ?? null,
-      sma200: trend?.sma200 ?? null
+      sma200: trend?.sma200 ?? null,
+      prev_sma20: prevSma20,
+      prev_sma50: prevSma50,
+      prev_sma200: prevSma200,
     },
-    spot: (technicals as any)?.last_close ?? null
+    spot: lastClose
   });
 
   return payload;
@@ -1117,6 +1128,153 @@ async function handleApi(req: Request, env: Env): Promise<Response> {
       const payload = await generateDailyOutlookReport(env, symbol, asof, prefs);
       const id = await saveTickerReport(env, symbol, asof, "daily_outlook", prefs, payload);
       return json({ cached: false, id, preferences: prefs, payload }, { headers: corsHeaders, status: 201 });
+    }
+
+    // Signals (fresh computation; also available inside daily-report payload)
+    if (method === "POST" && path === "/signals") {
+      requireSecret(req, env);
+      const body = await req.json<any>();
+      const symbol = String(body.symbol || "").toUpperCase();
+      const timeframe = String(body.timeframe || "D");
+      if (!symbol) return bad("symbol required");
+      if (timeframe !== "D") return bad("only daily timeframe supported in v1", 400);
+
+      const bars = await fetchOHLCV_StooqDaily(symbol, 260);
+      if (bars.length < 60) return bad("not_enough_ohlcv_history", 400);
+
+      const closes = bars.map((b) => b.close);
+      const sma20 = sma(closes, 20);
+      const sma50 = sma(closes, 50);
+      const sma200 = sma(closes, 200);
+      const rsi14 = rsiWilder(closes, 14);
+      const last = bars[bars.length - 1];
+      const prevSma20 = sma20[bars.length - 2] ?? null;
+      const prevSma50 = sma50[bars.length - 2] ?? null;
+      const prevSma200 = sma200[bars.length - 2] ?? null;
+
+      // quick key levels (last pivot on each side)
+      const pv = pivots(bars, 3);
+      const recentLows = pv.lows.slice(-5).map((x) => ({ date: x.date, price: x.price }));
+      const recentHighs = pv.highs.slice(-5).map((x) => ({ date: x.date, price: x.price }));
+
+      const sig = buildSignals({
+        timeframe: "D",
+        bars: bars.map((b) => ({ date: b.date, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume })),
+        rsi14: rsi14[bars.length - 1] ?? null,
+        rsi_divergence: { type: "none", strength: 0, pivot_dates: [] },
+        key_levels: { support: recentLows, resistance: recentHighs },
+        ma: {
+          sma20: sma20[bars.length - 1] ?? null,
+          sma50: sma50[bars.length - 1] ?? null,
+          sma200: sma200[bars.length - 1] ?? null,
+          prev_sma20: prevSma20,
+          prev_sma50: prevSma50,
+          prev_sma200: prevSma200,
+        },
+        spot: last.close,
+      });
+
+      return json({ symbol, timeframe: "D", signals: sig }, { headers: corsHeaders });
+    }
+
+    // RSS ingest (writes new alerts to D1)
+    if (method === "POST" && path === "/ingest/rss") {
+      requireSecret(req, env);
+      let inserted = 0;
+      let failed = 0;
+      for (const f of RSS_FEEDS) {
+        try {
+          const xml = await fetchText(f.url);
+          const items = parseFeedItems(xml).slice(0, 30);
+          for (const it of items) {
+            await upsertAlert(env, it, f.source);
+            inserted++;
+          }
+        } catch (_e) {
+          failed++;
+        }
+      }
+      return json({ ok: true, inserted, failed }, { headers: corsHeaders, status: 201 });
+    }
+
+    // Trades (journal)
+    if (method === "GET" && path === "/trades") {
+      const limit = Math.min(500, Number(url.searchParams.get("limit") || "100"));
+      const symbol = url.searchParams.get("symbol")?.toUpperCase();
+      let sql = `SELECT * FROM trades`;
+      const binds: any[] = [];
+      if (symbol) {
+        sql += ` WHERE symbol = ?`;
+        binds.push(symbol);
+      }
+      sql += ` ORDER BY datetime(created_at) DESC LIMIT ?`;
+      binds.push(limit);
+      const rows = await env.DB.prepare(sql).bind(...binds).all();
+      return json({ trades: rows.results }, { headers: corsHeaders });
+    }
+
+    if (method === "POST" && path === "/trades") {
+      requireSecret(req, env);
+      const body = await req.json<any>();
+      const id = crypto.randomUUID();
+      const created_at = nowIso();
+      const symbol = String(body.symbol || "").toUpperCase();
+      const direction = String(body.direction || "");
+      if (!symbol) return bad("symbol required");
+      if (!direction) return bad("direction required");
+      await env.DB.prepare(
+        `INSERT INTO trades (id, created_at, symbol, direction, strategy, timeframe, thesis, entry, stop, target, outcome, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          id,
+          created_at,
+          symbol,
+          direction,
+          body.strategy ?? null,
+          body.timeframe ?? null,
+          body.thesis ?? null,
+          body.entry ?? null,
+          body.stop ?? null,
+          body.target ?? null,
+          body.outcome ?? null,
+          body.notes ?? null
+        )
+        .run();
+      return json({ ok: true, id, created_at }, { headers: corsHeaders, status: 201 });
+    }
+
+    // PUT/DELETE by id: /trades/:id
+    if ((method === "PUT" || method === "DELETE") && path.startsWith("/trades/")) {
+      requireSecret(req, env);
+      const id = decodeURIComponent(path.slice("/trades/".length));
+      if (!id) return bad("id required");
+
+      if (method === "DELETE") {
+        await env.DB.prepare(`DELETE FROM trades WHERE id = ?`).bind(id).run();
+        return json({ ok: true }, { headers: corsHeaders });
+      }
+
+      const body = await req.json<any>();
+      await env.DB.prepare(
+        `UPDATE trades SET symbol = ?, direction = ?, strategy = ?, timeframe = ?, thesis = ?, entry = ?, stop = ?, target = ?, outcome = ?, notes = ?
+         WHERE id = ?`
+      )
+        .bind(
+          String(body.symbol || "").toUpperCase(),
+          String(body.direction || ""),
+          body.strategy ?? null,
+          body.timeframe ?? null,
+          body.thesis ?? null,
+          body.entry ?? null,
+          body.stop ?? null,
+          body.target ?? null,
+          body.outcome ?? null,
+          body.notes ?? null,
+          id
+        )
+        .run();
+      return json({ ok: true }, { headers: corsHeaders });
     }
 
     if (method === "GET" && path === "/daily-report") {
