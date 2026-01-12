@@ -3,6 +3,9 @@ import { buildSignals } from "./signals";
 export interface Env {
   DB: D1Database;
   APP_SECRET: string;
+  FINNHUB_API_KEY?: string;
+  POLYGON_API_KEY?: string;
+  DATA_PROVIDER?: string;
 }
 
 /* -------------------- utils -------------------- */
@@ -135,6 +138,111 @@ async function fetchOHLCV_StooqDaily(symbol: string, bars = 260): Promise<OHLCV[
   // Ensure ascending
   out.sort((a, b) => a.date.localeCompare(b.date));
   return out.slice(Math.max(0, out.length - bars));
+}
+
+/* -------------------- OHLCV (Finnhub) -------------------- */
+
+/**
+ * Finnhub candles endpoint:
+ *   https://finnhub.io/docs/api/stock-candles
+ * Response: { c,h,l,o,s,t,v }
+ */
+async function fetchOHLCV_FinnhubDaily(env: Env, symbol: string, bars = 260): Promise<OHLCV[]> {
+  const token = env.FINNHUB_API_KEY || "";
+  if (!token) throw new Error("finnhub_missing_key");
+
+  // Pull a bit more history than requested, then trim.
+  const now = Math.floor(Date.now() / 1000);
+  const from = now - 60 * 60 * 24 * 600; // ~600 days
+
+  const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(
+    symbol.toUpperCase()
+  )}&resolution=D&from=${from}&to=${now}&token=${encodeURIComponent(token)}`;
+
+  const res = await fetch(url, {
+    headers: {
+      "accept": "application/json",
+      "user-agent": "trader-hub/1.0",
+    },
+  });
+
+  if (!res.ok) throw new Error(`finnhub_fetch_failed ${res.status}`);
+  const data = (await res.json()) as any;
+  if (!data || data.s !== "ok" || !Array.isArray(data.t) || data.t.length < 5) {
+    throw new Error("finnhub_no_data");
+  }
+
+  const out: OHLCV[] = [];
+  for (let i = 0; i < data.t.length; i++) {
+    const ts = Number(data.t[i]);
+    const o = Number(data.o?.[i]);
+    const h = Number(data.h?.[i]);
+    const l = Number(data.l?.[i]);
+    const c = Number(data.c?.[i]);
+    const v = Number(data.v?.[i] ?? 0);
+    if (![ts, o, h, l, c, v].every((n) => Number.isFinite(n))) continue;
+    const date = new Date(ts * 1000).toISOString().slice(0, 10);
+    out.push({ date, open: o, high: h, low: l, close: c, volume: v });
+  }
+
+  if (out.length < 5) throw new Error("finnhub_no_data");
+  out.sort((a, b) => a.date.localeCompare(b.date));
+  return out.slice(Math.max(0, out.length - bars));
+}
+
+
+/* -------------------- OHLCV (Polygon) -------------------- */
+
+/**
+ * Polygon daily aggregates endpoint:
+ *   https://polygon.io/docs/stocks/get_v2_aggs_ticker__stocksticker__range__multiplier___timespan___from___to
+ * Response: { results: [{ t,o,h,l,c,v }], ... }
+ */
+async function fetchOHLCV_PolygonDaily(env: Env, symbol: string, bars = 260): Promise<OHLCV[]> {
+  const key = env.POLYGON_API_KEY || "";
+  if (!key) throw new Error("polygon_missing_key");
+
+  const now = new Date();
+  const to = now.toISOString().slice(0, 10);
+  const fromDate = new Date(now.getTime() - 1000 * 60 * 60 * 24 * 900); // ~900 days
+  const from = fromDate.toISOString().slice(0, 10);
+
+  const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(
+    symbol.toUpperCase()
+  )}/range/1/day/${from}/${to}?adjusted=true&sort=asc&limit=50000&apiKey=${encodeURIComponent(key)}`;
+
+  const res = await fetch(url, {
+    headers: { "accept": "application/json", "user-agent": "trader-hub/1.0" },
+  });
+  if (!res.ok) throw new Error(`polygon_fetch_failed ${res.status}`);
+  const data = (await res.json()) as any;
+  const results = data?.results;
+  if (!Array.isArray(results) || results.length < 5) throw new Error("polygon_no_data");
+
+  const out: OHLCV[] = results.map((r: any) => {
+    const ts = Number(r.t);
+    const date = new Date(ts).toISOString().slice(0, 10);
+    return {
+      date,
+      open: Number(r.o),
+      high: Number(r.h),
+      low: Number(r.l),
+      close: Number(r.c),
+      volume: Number(r.v ?? 0),
+    };
+  });
+
+  if (out.length < 5) throw new Error("polygon_no_data");
+  out.sort((a, b) => a.date.localeCompare(b.date));
+  return out.slice(Math.max(0, out.length - bars));
+}
+
+/* -------------------- OHLCV selector -------------------- */
+
+async function fetchOHLCV_Daily(env: Env, symbol: string, bars = 260): Promise<OHLCV[]> {
+  const provider = String(env.DATA_PROVIDER || "finnhub").toLowerCase();
+  if (provider === "polygon") return fetchOHLCV_PolygonDaily(env, symbol, bars);
+  return fetchOHLCV_FinnhubDaily(env, symbol, bars);
 }
 
 /* -------------------- indicators -------------------- */
@@ -731,7 +839,7 @@ async function getLatestWeeklyReport(env: Env, asof: string) {
 /* -------------------- daily report generator -------------------- */
 
 async function generateDailyOutlookReport(env: Env, symbol: string, asof: string, prefs: ReportPreferences) {
-  const bars = await fetchOHLCV_StooqDaily(symbol, 260);
+  const bars = await fetchOHLCV_Daily(env, symbol, 260);
 
   if (bars.length < 60) {
     throw new Error("not_enough_ohlcv_history");
@@ -970,16 +1078,22 @@ async function generateDailyOutlookReport(env: Env, symbol: string, asof: string
   const prevSma50 = sma50[bars.length - 2] ?? null;
   const prevSma200 = sma200[bars.length - 2] ?? null;
 
+  // Reference indicators from the assembled payload to avoid accidental
+  // outer-scope variable mismatches (e.g. `momentum is not defined`).
+  const _momentum = (payload as any).momentum;
+  const _trend = (payload as any).trend;
+  const _technicals = (payload as any).technicals;
+
   (payload as any).signals = buildSignals({
     timeframe: "D",
-    bars: (payload as any).technicals?.ohlcv ?? [],
-    rsi14: momentum?.rsi14 ?? null,
-    rsi_divergence: momentum?.rsi_divergence ?? null,
-    key_levels: technicals?.key_levels,
+    bars: _technicals?.ohlcv ?? [],
+    rsi14: _momentum?.rsi14 ?? null,
+    rsi_divergence: _momentum?.rsi_divergence ?? null,
+    key_levels: _technicals?.key_levels,
     ma: {
-      sma20: trend?.sma20 ?? null,
-      sma50: trend?.sma50 ?? null,
-      sma200: trend?.sma200 ?? null,
+      sma20: _trend?.sma20 ?? null,
+      sma50: _trend?.sma50 ?? null,
+      sma200: _trend?.sma200 ?? null,
       prev_sma20: prevSma20,
       prev_sma50: prevSma50,
       prev_sma200: prevSma200,
@@ -1139,7 +1253,7 @@ async function handleApi(req: Request, env: Env): Promise<Response> {
       if (!symbol) return bad("symbol required");
       if (timeframe !== "D") return bad("only daily timeframe supported in v1", 400);
 
-      const bars = await fetchOHLCV_StooqDaily(symbol, 260);
+      const bars = await fetchOHLCV_Daily(env, symbol, 260);
       if (bars.length < 60) return bad("not_enough_ohlcv_history", 400);
 
       const closes = bars.map((b) => b.close);
